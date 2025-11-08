@@ -76,6 +76,14 @@ const orderSchema = new mongoose.Schema({
     type: Date,
     default: Date.now
   }
+  ,
+  // Track cancellations initiated by the user
+  cancelledByUser: {
+    type: Boolean,
+    default: false
+  },
+  cancelledAt: Date,
+  cancelReason: String
 });
 
 // Generate unique order number before validation so required check passes

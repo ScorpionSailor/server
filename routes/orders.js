@@ -189,5 +189,48 @@ router.put('/:id/status', auth, adminAuth, async (req, res) => {
   }
 });
 
+// @route   PUT /api/orders/:id/cancel
+// @desc    Allow user to cancel their own order (if eligible)
+// @access  Private
+router.put('/:id/cancel', auth, async (req, res) => {
+  try {
+    const order = await Order.findById(req.params.id);
+
+    if (!order) {
+      return res.status(404).json({ message: 'Order not found' });
+    }
+
+    // Only the owner can cancel their order
+    if (order.user.toString() !== req.user.id) {
+      return res.status(403).json({ message: 'Access denied' });
+    }
+
+    // Only allow cancellation if order is not already shipped/delivered/cancelled
+    if (['shipped', 'delivered', 'cancelled'].includes(order.orderStatus)) {
+      return res.status(400).json({ message: `Order cannot be cancelled (status: ${order.orderStatus})` });
+    }
+
+    // Mark as cancelled by user
+    order.orderStatus = 'cancelled';
+    order.cancelledByUser = true;
+    order.cancelledAt = Date.now();
+    if (req.body.cancelReason) order.cancelReason = req.body.cancelReason;
+    order.updatedAt = Date.now();
+
+    // If payment was already completed for an online payment, mark as refunded
+    // NOTE: real refunds should be processed through the payment gateway; this is a simple flag update
+    if (order.paymentStatus === 'completed' && order.paymentMethod !== 'cod') {
+      order.paymentStatus = 'refunded';
+    }
+
+    await order.save();
+
+    res.json({ message: 'Order cancelled successfully', order });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ message: 'Server error', error: error.message });
+  }
+});
+
 module.exports = router;
 

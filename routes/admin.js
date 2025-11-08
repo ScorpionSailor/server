@@ -18,9 +18,36 @@ router.get('/stats', async (req, res) => {
     const totalOrders = await Order.countDocuments();
     const totalUsers = await User.countDocuments({ role: 'user' });
     
-    const totalRevenue = await Order.aggregate([
-      { $match: { paymentStatus: 'completed' } },
-      { $group: { _id: null, total: { $sum: '$total' } } }
+    // Get COD revenue (delivered orders only)
+    const codRevenue = await Order.aggregate([
+      { 
+        $match: { 
+          paymentMethod: 'cod',
+          orderStatus: 'delivered'
+        } 
+      },
+      { 
+        $group: { 
+          _id: null, 
+          total: { $sum: '$total' } 
+        } 
+      }
+    ]);
+
+    // Get online payments revenue (completed payments)
+    const onlineRevenue = await Order.aggregate([
+      { 
+        $match: { 
+          paymentMethod: { $in: ['upi', 'card', 'netbanking', 'razorpay'] },
+          paymentStatus: 'completed'
+        } 
+      },
+      { 
+        $group: { 
+          _id: null, 
+          total: { $sum: '$total' } 
+        } 
+      }
     ]);
 
     const recentOrders = await Order.find()
@@ -28,11 +55,22 @@ router.get('/stats', async (req, res) => {
       .sort({ createdAt: -1 })
       .limit(10);
 
+    // Count and sample orders cancelled by users
+    const canceledOrdersCount = await Order.countDocuments({ cancelledByUser: true });
+    const recentCanceledOrders = await Order.find({ cancelledByUser: true })
+      .populate('user', 'name email')
+      .sort({ cancelledAt: -1 })
+      .limit(10);
+
     res.json({
       totalProducts,
       totalOrders,
       totalUsers,
-      totalRevenue: totalRevenue[0]?.total || 0,
+      codRevenue: codRevenue[0]?.total || 0,
+      onlineRevenue: onlineRevenue[0]?.total || 0,
+      totalRevenue: (codRevenue[0]?.total || 0) + (onlineRevenue[0]?.total || 0),
+      canceledOrdersCount,
+      recentCanceledOrders,
       recentOrders
     });
   } catch (error) {
@@ -138,4 +176,20 @@ router.get('/users', async (req, res) => {
 });
 
 module.exports = router;
+
+// @route   GET /api/admin/canceled-orders
+// @desc    Get orders cancelled by users (Admin only)
+// @access  Private/Admin
+router.get('/canceled-orders', async (req, res) => {
+  try {
+    const orders = await Order.find({ cancelledByUser: true })
+      .populate('user', 'name email')
+      .populate('items.product', 'name images')
+      .sort({ cancelledAt: -1 });
+    res.json(orders);
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ message: 'Server error', error: error.message });
+  }
+});
 
