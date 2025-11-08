@@ -12,7 +12,11 @@ dotenv.config();
 const app = express();
 
 // Middleware
-app.use(cors());
+const allowed = ["https://maytastic.com", "https://www.maytastic.com"];
+app.use(cors({
+  origin: (origin, cb) => (!origin || allowed.includes(origin)) ? cb(null, true) : cb(new Error("CORS")),
+  credentials: true
+}));
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 app.use(morgan('dev'));
