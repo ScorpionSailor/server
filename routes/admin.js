@@ -145,6 +145,116 @@ router.post('/products', async (req, res) => {
   }
 });
 
+// @route   PATCH /api/admin/products/:id/stock
+// @desc    Restock or update product quantities (Admin only)
+// @access  Private/Admin
+router.patch('/products/:id/stock', async (req, res) => {
+  try {
+    const { newStock, delta, sizeStockUpdates } = req.body || {};
+
+    if (
+      newStock === undefined &&
+      delta === undefined &&
+      !Array.isArray(sizeStockUpdates)
+    ) {
+      return res.status(400).json({
+        message: 'Provide either newStock, delta, or sizeStockUpdates to adjust inventory'
+      });
+    }
+
+    const product = await Product.findById(req.params.id);
+    if (!product) {
+      return res.status(404).json({ message: 'Product not found' });
+    }
+
+    if (typeof newStock === 'number') {
+      if (newStock < 0) {
+        return res.status(400).json({ message: 'newStock must be zero or greater' });
+      }
+      product.stock = newStock;
+    } else if (typeof delta === 'number') {
+      const adjusted = (product.stock || 0) + delta;
+      if (adjusted < 0) {
+        return res.status(400).json({ message: 'Resulting stock cannot be negative' });
+      }
+      product.stock = adjusted;
+    }
+
+    if (Array.isArray(sizeStockUpdates) && sizeStockUpdates.length) {
+      const sizeMap = new Map(
+        sizeStockUpdates
+          .filter(
+            (entry) =>
+              entry &&
+              typeof entry.size === 'string' &&
+              typeof entry.stock === 'number' &&
+              entry.stock >= 0
+          )
+          .map((entry) => [
+            entry.size.toLowerCase(),
+            { stock: entry.stock, name: entry.size }
+          ])
+      );
+
+      if (sizeMap.size === 0) {
+        return res.status(400).json({ message: 'sizeStockUpdates must include valid size and stock values' });
+      }
+
+      const existingSizes = new Map(
+        (product.sizes || []).map((sizeEntry) => [
+          sizeEntry.size ? sizeEntry.size.toLowerCase() : '',
+          sizeEntry
+        ])
+      );
+
+      const updatedSizes = [];
+
+      existingSizes.forEach((value, key) => {
+        if (sizeMap.has(key)) {
+          const updateValue = sizeMap.get(key);
+          updatedSizes.push({
+            ...value,
+            stock: updateValue.stock
+          });
+          sizeMap.delete(key);
+        } else {
+          updatedSizes.push(value);
+        }
+      });
+
+      // Add new size entries that did not previously exist
+      sizeMap.forEach((updateValue) => {
+        updatedSizes.push({
+          size: updateValue.name,
+          stock: updateValue.stock
+        });
+      });
+
+      product.sizes = updatedSizes;
+
+      product.markModified('sizes');
+
+      if (typeof newStock !== 'number' && typeof delta !== 'number') {
+        product.stock = updatedSizes.reduce(
+          (sum, entry) => sum + (typeof entry.stock === 'number' ? entry.stock : 0),
+          0
+        );
+      }
+    }
+
+    product.inStock = product.hasAvailableStock();
+    await product.save();
+
+    res.json({
+      message: 'Product stock updated successfully',
+      product
+    });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ message: 'Server error', error: error.message });
+  }
+});
+
 // @route   GET /api/admin/orders
 // @desc    Get all orders for admin
 // @access  Private/Admin

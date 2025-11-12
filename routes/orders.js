@@ -1,4 +1,5 @@
 const express = require('express');
+const mongoose = require('mongoose');
 const Order = require('../models/Order');
 const Product = require('../models/Product');
 const { auth, adminAuth } = require('../middleware/auth');
@@ -17,6 +18,7 @@ const razorpay = new Razorpay({
 // @desc    Create new order
 // @access  Private
 router.post('/', auth, async (req, res) => {
+  const session = await mongoose.startSession();
   try {
     const { items, shippingAddress, paymentMethod } = req.body;
 
@@ -28,64 +30,178 @@ router.post('/', auth, async (req, res) => {
       return res.status(400).json({ message: 'Shipping address is required' });
     }
 
-    // Calculate totals
-    let subtotal = 0;
-    for (const item of items) {
-      const product = await Product.findById(item.product);
-      if (!product) {
-        return res.status(404).json({ message: `Product ${item.product} not found` });
+    const result = await session.withTransaction(async () => {
+      let subtotal = 0;
+      const orderItems = [];
+
+      for (const item of items) {
+        if (!item.product) {
+          const error = new Error('Invalid order item');
+          error.statusCode = 400;
+          throw error;
+        }
+
+        const product = await Product.findById(item.product).session(session);
+        if (!product) {
+          const error = new Error(`Product ${item.product} not found`);
+          error.statusCode = 404;
+          throw error;
+        }
+
+        const quantity = Number(item.quantity) || 0;
+        if (quantity <= 0) {
+          const error = new Error('Quantity must be greater than zero');
+          error.statusCode = 400;
+          throw error;
+        }
+
+        const baseStock = typeof product.stock === 'number' ? product.stock : 0;
+        const hasSizeVariants = Array.isArray(product.sizes) && product.sizes.length > 0;
+
+        // Handle size level stock if available
+        let selectedSizeEntry = null;
+        if (item.size) {
+          selectedSizeEntry = product.sizes?.find(
+            (size) => size.size?.toLowerCase() === item.size.toLowerCase()
+          );
+          if (!selectedSizeEntry) {
+            const error = new Error(`Size ${item.size} not available for ${product.name}`);
+            error.statusCode = 400;
+            throw error;
+          }
+          if ((selectedSizeEntry.stock || 0) < quantity) {
+            const error = new Error(`Insufficient stock for ${product.name} - size ${item.size}`);
+            error.statusCode = 409;
+            throw error;
+          }
+          selectedSizeEntry.stock = Math.max(0, (selectedSizeEntry.stock || 0) - quantity);
+          product.markModified('sizes');
+        }
+
+        if (!selectedSizeEntry && !hasSizeVariants && baseStock < quantity) {
+          const error = new Error(`${product.name} is out of stock`);
+          error.statusCode = 409;
+          throw error;
+        }
+
+        if (!selectedSizeEntry && hasSizeVariants) {
+          const variantTotal = product.sizes.reduce(
+            (sum, sizeEntry) => sum + (typeof sizeEntry.stock === 'number' ? sizeEntry.stock : 0),
+            0
+          );
+
+          if (variantTotal < quantity) {
+            const error = new Error(`${product.name} is out of stock`);
+            error.statusCode = 409;
+            throw error;
+          }
+        }
+
+        if (hasSizeVariants) {
+          const recalculated = product.sizes.reduce(
+            (sum, sizeEntry) => sum + (typeof sizeEntry.stock === 'number' ? sizeEntry.stock : 0),
+            0
+          );
+          product.stock = Math.max(0, recalculated);
+        } else {
+          product.stock = Math.max(0, baseStock - quantity);
+        }
+
+        product.inStock = product.hasAvailableStock();
+
+        // Persist stock changes
+        await product.save({ session });
+
+        const itemPrice = product.price;
+        subtotal += itemPrice * quantity;
+
+        // Default image selection: prioritize color-specific image if available
+        let itemImage = product.images && product.images[0] ? product.images[0].url : null;
+        if (item.color) {
+          const targetColor = item.color.toLowerCase();
+          const colorGallery =
+            product.colors?.find((color) => color.name?.toLowerCase() === targetColor);
+          if (colorGallery && Array.isArray(colorGallery.images) && colorGallery.images.length) {
+            itemImage = colorGallery.images[0]?.url || itemImage;
+          } else if (Array.isArray(product.images)) {
+            const colorMatch = product.images.find(
+              (img) => img.color && img.color.toLowerCase() === targetColor
+            );
+            if (colorMatch) {
+              itemImage = colorMatch.url;
+            }
+          }
+        }
+
+        orderItems.push({
+          product: product._id,
+          name: product.name,
+          size: item.size,
+          color: item.color,
+          quantity,
+          price: itemPrice,
+          image: itemImage
+        });
       }
-      subtotal += product.price * item.quantity;
-    }
 
-    const shipping = subtotal > 1000 ? 0 : 50;
-    const tax = subtotal * 0.18; // 18% GST
-    const total = subtotal + shipping + tax;
+      const shipping = subtotal > 1000 ? 0 : 50;
+      const tax = subtotal * 0.18; // 18% GST
+      const total = subtotal + shipping + tax;
 
-    // Create order
-    const order = new Order({
-      user: req.user.id,
-      items,
-      shippingAddress,
-      paymentMethod,
-      subtotal,
-      shipping,
-      tax,
-      total
+      const order = new Order({
+        user: req.user.id,
+        items: orderItems,
+        shippingAddress,
+        paymentMethod,
+        subtotal,
+        shipping,
+        tax,
+        total
+      });
+
+      if (['razorpay', 'upi', 'card', 'netbanking'].includes(paymentMethod)) {
+        try {
+          const razorpayOrder = await razorpay.orders.create({
+            amount: Math.round(total * 100), // paise
+            currency: 'INR',
+            receipt: `receipt_${Date.now()}`
+          });
+
+          order.razorpayOrderId = razorpayOrder.id;
+          await order.save({ session });
+
+          return {
+            order,
+            razorpayOrderId: razorpayOrder.id,
+            keyId: process.env.RAZORPAY_KEY_ID
+          };
+        } catch (razorpayError) {
+          console.error('Razorpay error:', razorpayError);
+          const error = new Error(razorpayError.message || 'Payment gateway error');
+          error.statusCode = 502;
+          throw error;
+        }
+      }
+
+      await order.save({ session });
+
+      return {
+        order,
+        message: 'Order created successfully'
+      };
     });
 
-    // Create Razorpay order if payment method is online
-    if (paymentMethod === 'razorpay' || paymentMethod === 'upi' || paymentMethod === 'card' || paymentMethod === 'netbanking') {
-      try {
-        const razorpayOrder = await razorpay.orders.create({
-          amount: total * 100, // Convert to paise
-          currency: 'INR',
-          receipt: `receipt_${Date.now()}`
-        });
-
-        order.razorpayOrderId = razorpayOrder.id;
-        await order.save();
-
-        return res.status(201).json({
-          order,
-          razorpayOrderId: razorpayOrder.id,
-          keyId: process.env.RAZORPAY_KEY_ID
-        });
-      } catch (razorpayError) {
-        console.error('Razorpay error:', razorpayError);
-        return res.status(500).json({ message: 'Payment gateway error', error: razorpayError.message });
-      }
+    if (result.razorpayOrderId) {
+      return res.status(201).json(result);
     }
 
-    await order.save();
-
-    res.status(201).json({
-      message: 'Order created successfully',
-      order
-    });
+    res.status(201).json(result);
   } catch (error) {
     console.error(error);
-    res.status(500).json({ message: 'Server error', error: error.message });
+    const status = error.statusCode || 500;
+    res.status(status).json({ message: error.message || 'Server error' });
+  } finally {
+    session.endSession();
   }
 });
 
