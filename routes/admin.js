@@ -112,7 +112,8 @@ router.post('/products', async (req, res) => {
       featured,
       trending,
       newArrival,
-      tags
+      tags,
+      shippingProfile
     } = req.body;
 
     if (!name || !description || price === undefined || !category || !type) {
@@ -134,7 +135,8 @@ router.post('/products', async (req, res) => {
       featured,
       trending,
       newArrival,
-      tags
+      tags,
+      shippingProfile
     });
 
     await product.save();

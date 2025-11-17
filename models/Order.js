@@ -1,5 +1,59 @@
 const mongoose = require('mongoose');
 
+const trackingEventSchema = new mongoose.Schema(
+  {
+    status: String,
+    location: String,
+    message: String,
+    eventAt: {
+      type: Date,
+      default: Date.now
+    }
+  },
+  { _id: false }
+);
+
+const shippingIntegrationSchema = new mongoose.Schema(
+  {
+    provider: {
+      type: String,
+      default: 'shiprocket'
+    },
+    orderId: String,
+    shipmentId: String,
+    courierCompanyId: Number,
+    courierName: String,
+    awb: String,
+    trackingUrl: String,
+    labelUrl: String,
+    invoiceUrl: String,
+    manifestUrl: String,
+    status: String,
+    statusCode: String,
+    pickupScheduledAt: Date,
+    deliveredAt: Date,
+    lastSyncedAt: Date,
+    etd: Date,
+    charge: Number,
+    codCharge: Number,
+    fuelSurcharge: Number,
+    totalCharge: Number,
+    weight: Number,
+    dimensions: {
+      length: Number,
+      breadth: Number,
+      height: Number
+    },
+    rateQuoteId: Number,
+    rateResponse: mongoose.Schema.Types.Mixed,
+    trackingHistory: [trackingEventSchema],
+    returnShipmentId: String,
+    returnAwb: String,
+    returnTrackingUrl: String
+  },
+  { _id: false }
+);
+
 const orderSchema = new mongoose.Schema({
   orderNumber: {
     type: String,
@@ -46,7 +100,22 @@ const orderSchema = new mongoose.Schema({
   },
   orderStatus: {
     type: String,
-    enum: ['pending', 'processing', 'shipped', 'delivered', 'cancelled'],
+    enum: [
+      'pending',
+      'processing',
+      'confirmed',
+      'pickup_scheduled',
+      'shipped',
+      'in_transit',
+      'out_for_delivery',
+      'delivered',
+      'cancelled',
+      'return_initiated',
+      'return_in_transit',
+      'returned',
+      'rto_initiated',
+      'rto_delivered'
+    ],
     default: 'pending'
   },
   razorpayOrderId: String,
@@ -60,6 +129,7 @@ const orderSchema = new mongoose.Schema({
     type: Number,
     default: 0
   },
+  estimatedDeliveryAt: Date,
   tax: {
     type: Number,
     default: 0
@@ -83,7 +153,21 @@ const orderSchema = new mongoose.Schema({
     default: false
   },
   cancelledAt: Date,
-  cancelReason: String
+  cancelReason: String,
+  shippingIntegration: shippingIntegrationSchema,
+  returnStatus: {
+    type: String,
+    enum: [
+      'none',
+      'return_initiated',
+      'return_in_transit',
+      'return_completed',
+      'return_cancelled'
+    ],
+    default: 'none'
+  },
+  returnRequestedAt: Date,
+  returnReason: String
 });
 
 // Generate unique order number before validation so required check passes

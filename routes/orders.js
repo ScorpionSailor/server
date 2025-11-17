@@ -5,6 +5,46 @@ const Product = require('../models/Product');
 const { auth, adminAuth } = require('../middleware/auth');
 const Razorpay = require('razorpay');
 const crypto = require('crypto');
+const shiprocketService = require('../services/shiprocket');
+
+const FALLBACK_WEIGHT =
+  Number(process.env.SHIPROCKET_FALLBACK_ITEM_WEIGHT_KG) || 0.5;
+const FALLBACK_LENGTH =
+  Number(process.env.SHIPROCKET_FALLBACK_LENGTH_CM) || 20;
+const FALLBACK_BREADTH =
+  Number(process.env.SHIPROCKET_FALLBACK_BREADTH_CM) || 16;
+const FALLBACK_HEIGHT =
+  Number(process.env.SHIPROCKET_FALLBACK_HEIGHT_CM) || 4;
+
+const getShippingMetrics = (product, quantity) => {
+  const profile = product.shippingProfile || {};
+  const weightPerUnit =
+    typeof profile.weight === 'number' && profile.weight > 0
+      ? profile.weight
+      : FALLBACK_WEIGHT;
+  const length = profile.length || FALLBACK_LENGTH;
+  const breadth = profile.breadth || FALLBACK_BREADTH;
+  const height = profile.height || FALLBACK_HEIGHT;
+
+  return {
+    weight: weightPerUnit * quantity,
+    length,
+    breadth,
+    height
+  };
+};
+
+const accumulateLogistics = (current, metrics) => {
+  return {
+    weight: Math.max(Number((current.weight || 0) + (metrics.weight || 0)), 0),
+    length: Math.max(current.length || 0, metrics.length || FALLBACK_LENGTH),
+    breadth: Math.max(
+      current.breadth || 0,
+      metrics.breadth || FALLBACK_BREADTH
+    ),
+    height: Math.max(current.height || 0, metrics.height || FALLBACK_HEIGHT)
+  };
+};
 
 const router = express.Router();
 
@@ -12,6 +52,64 @@ const router = express.Router();
 const razorpay = new Razorpay({
   key_id: process.env.RAZORPAY_KEY_ID || 'your_key_id',
   key_secret: process.env.RAZORPAY_KEY_SECRET || 'your_key_secret'
+});
+
+// @route   POST /api/orders/quote
+// @desc    Get shipping quote from Shiprocket
+// @access  Private
+router.post('/quote', auth, async (req, res) => {
+  try {
+    const {
+      destinationPincode,
+      cod = false,
+      orderAmount = 0,
+      weight,
+      dimensions = {}
+    } = req.body || {};
+
+    if (!destinationPincode) {
+      return res
+        .status(400)
+        .json({ message: 'destinationPincode is required' });
+    }
+
+    const fallbackCharge = orderAmount > 1000 ? 0 : 50;
+
+    if (!shiprocketService.isEnabled()) {
+      return res.json({
+        providerEnabled: false,
+        charge: fallbackCharge,
+        etd: null
+      });
+    }
+
+    const quote = await shiprocketService.getRateQuote({
+      destinationPincode,
+      cod,
+      orderAmount,
+      weight,
+      dimensions
+    });
+
+    if (!quote) {
+      return res.json({
+        providerEnabled: true,
+        charge: fallbackCharge,
+        etd: null
+      });
+    }
+
+    res.json({
+      providerEnabled: true,
+      ...quote
+    });
+  } catch (error) {
+    console.error('Shiprocket quote error:', error?.response?.data || error);
+    res.status(502).json({
+      message: 'Unable to fetch shipping quote at the moment',
+      providerEnabled: shiprocketService.isEnabled()
+    });
+  }
 });
 
 // @route   POST /api/orders
@@ -33,6 +131,12 @@ router.post('/', auth, async (req, res) => {
     const result = await session.withTransaction(async () => {
       let subtotal = 0;
       const orderItems = [];
+      let logisticsSummary = {
+        weight: 0,
+        length: FALLBACK_LENGTH,
+        breadth: FALLBACK_BREADTH,
+        height: FALLBACK_HEIGHT
+      };
 
       for (const item of items) {
         if (!item.product) {
@@ -142,6 +246,9 @@ router.post('/', auth, async (req, res) => {
           price: itemPrice,
           image: itemImage
         });
+
+        const metrics = getShippingMetrics(product, quantity);
+        logisticsSummary = accumulateLogistics(logisticsSummary, metrics);
       }
 
       const shipping = subtotal > 1000 ? 0 : 50;
@@ -171,7 +278,9 @@ router.post('/', auth, async (req, res) => {
           await order.save({ session });
 
           return {
+            orderId: order._id,
             order,
+            logistics: logisticsSummary,
             razorpayOrderId: razorpayOrder.id,
             keyId: process.env.RAZORPAY_KEY_ID
           };
@@ -186,16 +295,99 @@ router.post('/', auth, async (req, res) => {
       await order.save({ session });
 
       return {
+        orderId: order._id,
         order,
+        logistics: logisticsSummary,
         message: 'Order created successfully'
       };
     });
 
-    if (result.razorpayOrderId) {
-      return res.status(201).json(result);
+    let order = await Order.findById(result.orderId).populate(
+      'user',
+      'name email phone'
+    );
+    const logistics = result.logistics || {
+      weight: FALLBACK_WEIGHT,
+      length: FALLBACK_LENGTH,
+      breadth: FALLBACK_BREADTH,
+      height: FALLBACK_HEIGHT
+    };
+
+    const fallbackShipping = order.subtotal > 1000 ? 0 : 50;
+    let shippingQuote = null;
+
+    if (shiprocketService.isEnabled()) {
+      try {
+        shippingQuote = await shiprocketService.getRateQuote({
+          destinationPincode: order.shippingAddress?.pincode,
+          cod: order.paymentMethod === 'cod',
+          orderAmount: order.subtotal + order.tax,
+          weight: logistics.weight,
+          dimensions: logistics
+        });
+      } catch (quoteError) {
+        console.error(
+          'Shiprocket quote post-order error:',
+          quoteError?.response?.data || quoteError
+        );
+      }
     }
 
-    res.status(201).json(result);
+    const shippingCharge = shippingQuote?.charge ?? fallbackShipping;
+    order.shipping = shippingCharge;
+    order.total = order.subtotal + order.tax + shippingCharge;
+    if (shippingQuote?.etd) {
+      order.estimatedDeliveryAt = shippingQuote.etd;
+    }
+
+    if (shiprocketService.isEnabled()) {
+      order.shippingIntegration = {
+        ...(order.shippingIntegration || {}),
+        provider: shiprocketService.providerName,
+        weight: logistics.weight,
+        dimensions: {
+          length: logistics.length,
+          breadth: logistics.breadth,
+          height: logistics.height
+        },
+        charge: shippingQuote?.charge ?? order.shippingIntegration?.charge,
+        codCharge:
+          shippingQuote?.codCharge ?? order.shippingIntegration?.codCharge,
+        totalCharge:
+          shippingQuote?.totalCharge ?? order.shippingIntegration?.totalCharge,
+        etd: shippingQuote?.etd ?? order.shippingIntegration?.etd,
+        rateQuoteId:
+          shippingQuote?.courierCompanyId ||
+          order.shippingIntegration?.rateQuoteId,
+        rateResponse:
+          shippingQuote?.raw || order.shippingIntegration?.rateResponse,
+        lastSyncedAt: new Date()
+      };
+    }
+
+    await order.save();
+
+    if (shiprocketService.isEnabled()) {
+      try {
+        order = await shiprocketService.createShipment(order, {
+          logistics,
+          quote: shippingQuote
+        });
+      } catch (shipmentError) {
+        console.error(
+          'Shiprocket shipment error:',
+          shipmentError?.response?.data || shipmentError
+        );
+      }
+    }
+
+    const responsePayload = {
+      ...result,
+      order
+    };
+    delete responsePayload.logistics;
+
+    res.status(201).json(responsePayload);
   } catch (error) {
     console.error(error);
     const status = error.statusCode || 500;
@@ -282,26 +474,178 @@ router.get('/all', auth, adminAuth, async (req, res) => {
   }
 });
 
-// @route   PUT /api/orders/:id/status
-// @desc    Update order status (Admin only)
-// @access  Private/Admin
-router.put('/:id/status', auth, adminAuth, async (req, res) => {
+// @route   GET /api/orders/:id/tracking
+// @desc    Fetch latest tracking information for an order
+// @access  Private
+router.get('/:id/tracking', auth, async (req, res) => {
   try {
-    const { orderStatus } = req.body;
-    const order = await Order.findByIdAndUpdate(
-      req.params.id,
-      { orderStatus, updatedAt: Date.now() },
-      { new: true }
+    const order = await Order.findById(req.params.id).populate(
+      'user',
+      'name email phone role'
     );
 
     if (!order) {
       return res.status(404).json({ message: 'Order not found' });
     }
 
-    res.json(order);
+    const isOwner = order.user?._id?.toString() === req.user.id;
+    const isAdmin = req.user.role === 'admin';
+
+    if (!isOwner && !isAdmin) {
+      return res.status(403).json({ message: 'Access denied' });
+    }
+
+    if (shiprocketService.isEnabled() && order.shippingIntegration?.awb) {
+      try {
+        await shiprocketService.fetchTracking(order);
+      } catch (trackingError) {
+        console.error(
+          'Shiprocket tracking error:',
+          trackingError?.response?.data || trackingError
+        );
+      }
+    }
+
+    res.json({
+      orderStatus: order.orderStatus,
+      estimatedDeliveryAt: order.estimatedDeliveryAt,
+      shippingIntegration: order.shippingIntegration
+    });
   } catch (error) {
-    console.error(error);
+    console.error('Tracking fetch error:', error);
     res.status(500).json({ message: 'Server error', error: error.message });
+  }
+});
+
+// @route   PUT /api/orders/:id/status
+// @desc    Update order status (Admin only)
+// @access  Private/Admin
+router.put('/:id/status', auth, adminAuth, async (req, res) => {
+  try {
+    if (!shiprocketService.isEnabled()) {
+      return res.status(400).json({
+        message:
+          'Shiprocket integration is disabled. Manual status updates are no longer supported.'
+      });
+    }
+
+    const order = await shiprocketService.syncTracking(req.params.id);
+    res.json({
+      message: 'Order status refreshed from Shiprocket',
+      order
+    });
+  } catch (error) {
+    console.error('Status sync error:', error);
+    res.status(500).json({ message: 'Server error', error: error.message });
+  }
+});
+
+// @route   POST /api/orders/:id/return
+// @desc    Initiate a return shipment
+// @access  Private
+router.post('/:id/return', auth, async (req, res) => {
+  try {
+    const order = await Order.findById(req.params.id).populate(
+      'user',
+      'name email phone role'
+    );
+
+    if (!order) {
+      return res.status(404).json({ message: 'Order not found' });
+    }
+
+    const isOwner = order.user?._id?.toString() === req.user.id;
+    const isAdmin = req.user.role === 'admin';
+
+    if (!isOwner && !isAdmin) {
+      return res.status(403).json({ message: 'Access denied' });
+    }
+
+    if (order.orderStatus !== 'delivered') {
+      return res
+        .status(400)
+        .json({ message: 'Only delivered orders can be returned' });
+    }
+
+    if (order.returnStatus && order.returnStatus !== 'none') {
+      return res
+        .status(400)
+        .json({ message: 'Return has already been initiated for this order' });
+    }
+
+    const reason = req.body?.reason?.trim() || 'Customer return';
+
+    let updatedOrder = order;
+    const logistics = {
+      weight:
+        order.shippingIntegration?.weight ||
+        order.items.reduce(
+          (sum, item) => sum + FALLBACK_WEIGHT * item.quantity,
+          0
+        ) ||
+        FALLBACK_WEIGHT,
+      length:
+        order.shippingIntegration?.dimensions?.length || FALLBACK_LENGTH,
+      breadth:
+        order.shippingIntegration?.dimensions?.breadth || FALLBACK_BREADTH,
+      height: order.shippingIntegration?.dimensions?.height || FALLBACK_HEIGHT
+    };
+
+    if (shiprocketService.isEnabled()) {
+      try {
+        updatedOrder = await shiprocketService.createReturnShipment(order, {
+          logistics,
+          reason
+        });
+      } catch (returnError) {
+        console.error(
+          'Shiprocket return error:',
+          returnError?.response?.data || returnError
+        );
+        return res.status(502).json({
+          message: 'Unable to schedule return shipment at the moment'
+        });
+      }
+    } else {
+      order.returnStatus = 'return_initiated';
+      order.returnReason = reason;
+      order.returnRequestedAt = new Date();
+      await order.save();
+      updatedOrder = order;
+    }
+
+    res.json({
+      message: 'Return initiated successfully',
+      order: updatedOrder
+    });
+  } catch (error) {
+    console.error('Return initiation error:', error);
+    res.status(500).json({ message: 'Server error', error: error.message });
+  }
+});
+
+// @route   POST /api/orders/:id/sync
+// @desc    Force sync order status with Shiprocket (Admin)
+// @access  Private/Admin
+router.post('/:id/sync', auth, adminAuth, async (req, res) => {
+  try {
+    if (!shiprocketService.isEnabled()) {
+      return res
+        .status(400)
+        .json({ message: 'Shiprocket integration is not configured' });
+    }
+
+    const order = await shiprocketService.syncTracking(req.params.id);
+    res.json({
+      message: 'Order synced with Shiprocket successfully',
+      order
+    });
+  } catch (error) {
+    console.error('Shiprocket sync error:', error);
+    res.status(500).json({
+      message: 'Failed to sync shipment with Shiprocket',
+      error: error.message
+    });
   }
 });
 
@@ -310,31 +654,70 @@ router.put('/:id/status', auth, adminAuth, async (req, res) => {
 // @access  Private
 router.put('/:id/cancel', auth, async (req, res) => {
   try {
-    const order = await Order.findById(req.params.id);
+    const order = await Order.findById(req.params.id).populate(
+      'user',
+      'name email phone'
+    );
 
     if (!order) {
       return res.status(404).json({ message: 'Order not found' });
     }
 
-    // Only the owner can cancel their order
-    if (order.user.toString() !== req.user.id) {
+    const isOwner = order.user && order.user._id
+      ? order.user._id.toString() === req.user.id
+      : order.user.toString() === req.user.id;
+    const isAdmin = req.user.role === 'admin';
+
+    if (!isOwner && !isAdmin) {
       return res.status(403).json({ message: 'Access denied' });
     }
 
-    // Only allow cancellation if order is not already shipped/delivered/cancelled
-    if (['shipped', 'delivered', 'cancelled'].includes(order.orderStatus)) {
-      return res.status(400).json({ message: `Order cannot be cancelled (status: ${order.orderStatus})` });
+    const nonCancelableStatuses = [
+      'in_transit',
+      'out_for_delivery',
+      'delivered',
+      'return_in_transit',
+      'returned',
+      'cancelled',
+      'rto_delivered'
+    ];
+
+    if (!isAdmin && nonCancelableStatuses.includes(order.orderStatus)) {
+      return res.status(400).json({
+        message: `Order cannot be cancelled (status: ${order.orderStatus})`
+      });
     }
 
-    // Mark as cancelled by user
-    order.orderStatus = 'cancelled';
-    order.cancelledByUser = true;
-    order.cancelledAt = Date.now();
-    if (req.body.cancelReason) order.cancelReason = req.body.cancelReason;
-    order.updatedAt = Date.now();
+    if (
+      shiprocketService.isEnabled() &&
+      order.shippingIntegration?.awb &&
+      !['delivered', 'return_in_transit', 'returned'].includes(
+        order.orderStatus
+      )
+    ) {
+      try {
+        await shiprocketService.cancelShipment(order);
+      } catch (cancelError) {
+        console.error(
+          'Shiprocket cancel shipment error:',
+          cancelError?.response?.data || cancelError
+        );
+      }
+    }
 
-    // If payment was already completed for an online payment, mark as refunded
-    // NOTE: real refunds should be processed through the payment gateway; this is a simple flag update
+    order.orderStatus = 'cancelled';
+    order.cancelledByUser = !isAdmin;
+    order.cancelledAt = Date.now();
+    order.cancelReason =
+      req.body.cancelReason ||
+      order.cancelReason ||
+      (isAdmin ? 'Cancelled by admin' : 'Cancelled by user');
+    order.updatedAt = Date.now();
+    if (order.shippingIntegration) {
+      order.shippingIntegration.status = 'cancelled';
+      order.shippingIntegration.lastSyncedAt = new Date();
+    }
+
     if (order.paymentStatus === 'completed' && order.paymentMethod !== 'cod') {
       order.paymentStatus = 'refunded';
     }

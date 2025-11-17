@@ -71,6 +71,36 @@ const colorSchema = new mongoose.Schema(
   { _id: false }
 );
 
+const shippingProfileSchema = new mongoose.Schema(
+  {
+    weight: {
+      type: Number,
+      default: 0.5,
+      min: 0
+    },
+    length: {
+      type: Number,
+      default: 20,
+      min: 0
+    },
+    breadth: {
+      type: Number,
+      default: 16,
+      min: 0
+    },
+    height: {
+      type: Number,
+      default: 4,
+      min: 0
+    },
+    hsCode: {
+      type: String,
+      trim: true
+    }
+  },
+  { _id: false }
+);
+
 const productSchema = new mongoose.Schema(
   {
     name: {
@@ -138,6 +168,15 @@ const productSchema = new mongoose.Schema(
     tags: {
       type: [String],
       default: []
+    },
+    shippingProfile: {
+      type: shippingProfileSchema,
+      default: () => ({
+        weight: 0.5,
+        length: 20,
+        breadth: 16,
+        height: 4
+      })
     }
   },
   {
