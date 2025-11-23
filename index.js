@@ -3,7 +3,7 @@ const cors = require('cors');
 const morgan = require('morgan');
 const dotenv = require('dotenv');
 const path = require('path');
-const connectoDB = require('./config/bd.config');
+const connectoDB = require('./config/db.config');
 
 // Connect to Database
 connectoDB();
